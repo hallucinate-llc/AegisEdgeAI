@@ -1,0 +1,60 @@
+# Simple Docker Compose for AegisEdgeAI ARM64
+version: '3.8'
+
+services:
+  aegis-simple:
+    build:
+      context: .
+      dockerfile: Dockerfile.simple
+    container_name: aegis-simple-arm64
+    restart: unless-stopped
+    
+    # Environment variables
+    environment:
+      - TPM2TOOLS_TCTI=swtpm:host=127.0.0.1,port=2321
+      - PYTHONPATH=/app
+      - FLASK_ENV=production
+    
+    # Port mappings
+    ports:
+      - "5000:5000"  # Agent service
+      - "5001:5001"  # Collector service  
+      - "5002:5002"  # Gateway service
+      - "2321:2321"  # TPM control port
+      - "2322:2322"  # TPM data port
+    
+    # Volume mounts for persistence
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - tpm-state:/home/aegis/.swtpm
+    
+    # Resource limits for edge devices
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 1G
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    
+    # Networking
+    networks:
+      - aegis-network
+
+volumes:
+  tpm-state:
+    driver: local
+
+networks:
+  aegis-network:
+    driver: bridge

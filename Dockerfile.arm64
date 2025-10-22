@@ -1,0 +1,177 @@
+# Multi-stage ARM64 Dockerfile for AegisEdgeAI
+# Optimized for ARM64 devices and edge deployment
+
+FROM ubuntu:22.04 as builder
+
+# Avoid interactive prompts during build
+ENV DEBIAN_FRONTEND=noninteractive
+ENV ARCH=aarch64
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    autoconf \
+    automake \
+    libtool \
+    pkg-config \
+    git \
+    cmake \
+    libssl-dev \
+    libjson-c-dev \
+    libcurl4-openssl-dev \
+    uuid-dev \
+    libglib2.0-dev \
+    libtasn1-6-dev \
+    libgnutls28-dev \
+    python3 \
+    python3-dev \
+    python3-pip \
+    wget \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set ARM64-specific build environment
+ENV PREFIX="/usr/local"
+ENV PKG_CONFIG_PATH="/usr/local/lib/pkgconfig"
+ENV LD_LIBRARY_PATH="/usr/local/lib"
+ENV PATH="/usr/local/bin:$PATH"
+
+# Create build directory
+WORKDIR /tmp/build
+
+# Build libtpms for ARM64
+RUN git clone https://github.com/stefanberger/libtpms.git && \
+    cd libtpms && \
+    ./autogen.sh --with-tpm2 --with-openssl --prefix=$PREFIX && \
+    make -j$(nproc) && \
+    make install && \
+    cd .. && rm -rf libtpms
+
+# Build swtpm for ARM64
+RUN git clone https://github.com/stefanberger/swtpm.git && \
+    cd swtpm && \
+    ./autogen.sh --with-tpm2 --with-openssl --prefix=$PREFIX && \
+    make -j$(nproc) && \
+    make install && \
+    cd .. && rm -rf swtpm
+
+# Build tpm2-tss for ARM64
+RUN git clone https://github.com/tpm2-software/tpm2-tss.git && \
+    cd tpm2-tss && \
+    ./bootstrap && \
+    ./configure --prefix=$PREFIX --with-tctidefaultmodule=libtss2-tcti-swtpm && \
+    make -j$(nproc) && \
+    make install && \
+    cd .. && rm -rf tpm2-tss
+
+# Build tpm2-tools for ARM64
+RUN git clone https://github.com/tpm2-software/tpm2-tools.git && \
+    cd tpm2-tools && \
+    ./bootstrap && \
+    ./configure --prefix=$PREFIX && \
+    make -j$(nproc) && \
+    make install && \
+    cd .. && rm -rf tpm2-tools
+
+# Update library cache
+RUN ldconfig
+
+# Runtime stage - smaller final image
+FROM ubuntu:22.04 as runtime
+
+# Install runtime dependencies only
+RUN apt-get update && apt-get install -y \
+    python3 \
+    python3-pip \
+    libssl3 \
+    libjson-c5 \
+    libcurl4 \
+    uuid-runtime \
+    libglib2.0-0 \
+    libtasn1-6 \
+    libgnutls30 \
+    netcat-openbsd \
+    curl \
+    procps \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy built TPM stack from builder stage
+COPY --from=builder /usr/local /usr/local
+
+# Set ARM64 environment variables
+ENV PREFIX="/usr/local"
+ENV PKG_CONFIG_PATH="/usr/local/lib/pkgconfig"
+ENV LD_LIBRARY_PATH="/usr/local/lib"
+ENV PATH="/usr/local/bin:$PATH"
+ENV TPM2TOOLS_TCTI="swtpm:host=127.0.0.1,port=2321"
+
+# Update library cache
+RUN ldconfig
+
+# Create application user
+RUN useradd -m -s /bin/bash aegis && \
+    mkdir -p /app /var/lib/swtpm-localca && \
+    chown -R aegis:aegis /app /var/lib/swtpm-localca
+
+# Set working directory
+WORKDIR /app
+
+# Copy application code
+COPY --chown=aegis:aegis . .
+
+# Make scripts executable
+RUN chmod +x zero-trust/system-setup.sh \
+    zero-trust/system-setup-arm64.sh \
+    zero-trust/tpm/swtpm.sh \
+    zero-trust/tpm/tpm-ek-ak-persist.sh \
+    zero-trust/initall.sh \
+    test-arm64-implementation.sh
+
+# Install Python dependencies
+RUN pip3 install --no-cache-dir -r zero-trust/requirements.txt
+
+# Build ARM64-specific binaries
+WORKDIR /app/zero-trust/tpm
+RUN make clean && make
+
+# Switch to application user
+USER aegis
+
+# Create TPM state directory
+RUN mkdir -p ~/.swtpm/ztpm
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+    CMD curl -f http://localhost:5000/health || exit 1
+
+# Expose ports
+EXPOSE 5000 5001 5002 2321 2322
+
+# Create startup script
+WORKDIR /app
+RUN echo '#!/bin/bash' > start.sh && \
+    echo 'set -e' >> start.sh && \
+    echo 'echo "=== Starting AegisEdgeAI on ARM64 ==="' >> start.sh && \
+    echo 'echo "Architecture: $(uname -m)"' >> start.sh && \
+    echo 'echo "TPM Stack: $(swtpm --version | head -1)"' >> start.sh && \
+    echo 'echo "Python: $(python3 --version)"' >> start.sh && \
+    echo '' >> start.sh && \
+    echo '# Start software TPM' >> start.sh && \
+    echo 'echo "Starting software TPM..."' >> start.sh && \
+    echo 'cd zero-trust/tpm' >> start.sh && \
+    echo './swtpm.sh &' >> start.sh && \
+    echo 'sleep 3' >> start.sh && \
+    echo '' >> start.sh && \
+    echo '# Initialize TPM keys' >> start.sh && \
+    echo 'echo "Initializing TPM keys..."' >> start.sh && \
+    echo './tpm-ek-ak-persist.sh' >> start.sh && \
+    echo 'cd ../..' >> start.sh && \
+    echo '' >> start.sh && \
+    echo '# Start AegisEdgeAI services' >> start.sh && \
+    echo 'echo "Starting AegisEdgeAI services..."' >> start.sh && \
+    echo 'cd zero-trust' >> start.sh && \
+    echo './initall.sh' >> start.sh && \
+    chmod +x start.sh
+
+# Default command
+CMD ["./start.sh"]
